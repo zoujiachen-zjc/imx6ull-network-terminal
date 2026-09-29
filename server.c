@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <string.h>
-
+#include <stdlib.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -9,25 +9,68 @@
 #include <sys/ioctl.h>
 #include <net/if.h>
 #include <arpa/inet.h>
-
+#include <pthread.h>
 
 #define PORT 8888
 #define LED_BRIGHTNESS  "/sys/class/leds/red/brightness"
 #define LED_TRIGGER     "/sys/class/leds/red/trigger"
 
+/*定义全局锁*/
+static pthread_mutex_t led_mutex=PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t cpu_mutex=PTHREAD_MUTEX_INITIALIZER;
 
+/*cpu占用率*/
+static double g_cpu_usage=0.0;
+
+/*后台线程*/
+static void *cpu_monitor(void *arg){
+    unsigned long long t1=0,t2=0,i1=0,i2=0;
+    unsigned long long dt=0,di=0;
+    double usage;
+    (void) arg;
+    while(1){
+        if(read_cpu_snapshot(&t1,&i1)<0){
+            sleep(1);
+            continue;
+        }
+        usleep(1000000);
+        if(read_cpu_snapshot(&t2,&i2)<0){
+            sleep(1);
+            continue;
+        }
+        dt=t2-t1;
+        di=i2-i1;
+        if(dt==0){
+            sleep(1);
+            continue;
+        }
+        usage=(double)(dt-di)*100.0/(double)dt;
+        pthread_mutex_lock(&cpu_mutex);
+        g_cpu_usage=usage;
+        pthread_mutex_unlock(&cpu_mutex);
+    }
+    return NULL;
+}
 
 
 //设置led
-int set_led(int on){
+int set_led(int on){    
     FILE *fp;
+    int ret=-1;
+    pthread_mutex_lock(&led_mutex);
+    
     fp=fopen(LED_BRIGHTNESS,"w");
-    if(fp==NULL){
-        perror("led open");
-        return -1;
+    if(fp!=NULL){
+        fprintf(fp,"%d",on?1:0);
+        fclose(fp);
+        ret=0;
     }
-    fprintf(fp,"%d",on?1:0);
-    fclose(fp);
+    else{
+        perror("led open");
+        ret=-1;
+    }
+    pthread_mutex_unlock(&led_mutex);
+    return -1;
 }
 //获取执行时间
 void get_uptime(char * buf,int size){
@@ -94,26 +137,10 @@ int read_cpu_snapshot(unsigned long long *total,unsigned long long *idle){
 }
 //获取cpu占用率
 void get_cpu(char *buf,int size){
-
-    unsigned long long t1=0,i1=0,t2=0,i2=0;
-    unsigned long long dt=0,di=0;
     double usage;
-    if(read_cpu_snapshot(&t1,&i1)<0){
-        snprintf(buf,size,"GET_CPU ERROR");
-        return ;
-    }
-    usleep(1000000);
-    if(read_cpu_snapshot(&t2,&i2)<0){
-        snprintf(buf,size,"GET_CPU ERROR");
-        return ;
-    }
-    dt=t2-t1;
-    di=i2-i1;
-    if(dt==0){
-        snprintf(buf,size,"GET_CPU ERROR");
-        return ;
-    }
-    usage=(double)(dt-di)*100.0/(double)dt;
+    pthread_mutex_lock(&cpu_mutex);
+    usage=g_cpu_usage;
+    pthread_mutex_unlock(&cpu_mutex);
     snprintf(buf,size,"CPU: %.1f%%", usage);
 }
 
@@ -170,7 +197,59 @@ void get_temp(char *buf,int size){
     fclose(fp);
     snprintf(buf,size,"TEMP:%lf C",temp_mc/1000.0);
 }
+/*线程函数*/
+void *client_handler(void *arg) {
 
+  int client_fd = *(int *)arg;
+  /*用完立刻释放，避免内存泄漏*/
+  free(arg);
+  char buf[1024];
+  char send_buf[1024];
+  while (1) {
+    memset(buf, 0, sizeof(buf));
+    memset(send_buf, 0, sizeof(send_buf));
+    ssize_t n = recv(client_fd, buf, sizeof(buf) - 1, 0);
+    if (n == 0) {
+      printf("客户端已断开连接\n");
+      break;
+    } else if (n < 0) {
+      perror("recv");
+      break;
+    } else {
+      printf("recv:%s\n", buf);
+      if (strcmp(buf, "PING") == 0) {
+        snprintf(send_buf, sizeof(send_buf), "PONG");
+      } else if (strcmp(buf, "GET_UPTIME") == 0) {
+        get_uptime(send_buf, sizeof(send_buf));
+      } else if (strcmp(buf, "GET_MEM") == 0) {
+        get_mem(send_buf, sizeof(send_buf));
+      } else if (strcmp(buf, "GET_CPU") == 0) {
+        get_cpu(send_buf, sizeof(send_buf));
+      } else if (strcmp(buf, "GET_IP") == 0) {
+        get_ip(send_buf, sizeof(send_buf));
+      } else if (strcmp(buf, "GET_TEMP") == 0) {
+        get_temp(send_buf, sizeof(send_buf));
+      } else if (strcmp(buf, "LED_ON") == 0) {
+        if (set_led(1) == 0) {
+          snprintf(send_buf, sizeof(send_buf), "LED_ON");
+        } else {
+          snprintf(send_buf, sizeof(send_buf), "LED_ERROR");
+        }
+      } else if (strcmp(buf, "LED_OFF") == 0) {
+        if (set_led(0) == 0) {
+          snprintf(send_buf, sizeof(send_buf), "LED_OFF");
+        } else {
+          snprintf(send_buf, sizeof(send_buf), "LED_ERROR");
+        }
+      } else {
+        snprintf(send_buf, sizeof(send_buf), "Unknown Command", buf);
+      }
+      send(client_fd, send_buf, strlen(send_buf), 0);
+    }
+  }
+  close(client_fd);
+  return NULL;
+}
 int main(){
 
     //1.创建socket
@@ -200,72 +279,32 @@ int main(){
     }
     //4.监听
     listen(server_fd,5);
-    printf("server wait ....\n");
-    //5.等待客户端
-    client_fd=accept(server_fd,NULL,NULL);
-    if(client_fd<0){
-        perror("accept");
+    pthread_t cpu_tid;
+    if(pthread_create(&cpu_tid,NULL,cpu_monitor,NULL)!=0){
+        perror("cpu thread create");
         close(server_fd);
         return -1;
-
     }
+    pthread_detach(cpu_tid);
+    printf("server wait ....\n");
     while(1){
-        memset(buf,0,sizeof(buf));
-        memset(send_buf,0,sizeof(send_buf));
-        ssize_t n= recv(client_fd,buf,sizeof(buf)-1,0);
-        if(n==0){
-            printf("客户端已断开连接\n");
-            break;
+        int *pfd=malloc(sizeof(int));
+        *pfd=accept(server_fd,NULL,NULL);
+        if(*pfd<0){
+            perror("accept");
+            free(pfd);
+            continue;
         }
-        else if(n<0){
-            perror("recv");
-            break;
+        printf("客户端已连接\n");
+        pthread_t tid;
+        if(pthread_create(&tid,NULL,client_handler,pfd)!=0){
+            perror("pthread_create");
+            close(*pfd);
+            free(pfd);
+            continue;
         }
-        else{
-            printf("recv:%s\n",buf);
-            
-            if(strcmp(buf,"PING")==0){
-                snprintf(send_buf,sizeof(send_buf),"PONG");
-            }
-            else if(strcmp(buf,"GET_UPTIME")==0){
-                 get_uptime(send_buf,sizeof(send_buf));
-            }
-            else if(strcmp(buf,"GET_MEM")==0){
-                get_mem(send_buf,sizeof(send_buf));
-            }
-            else if(strcmp(buf,"GET_CPU")==0){
-                get_cpu(send_buf,sizeof(send_buf));
-            }
-            else if(strcmp(buf,"GET_IP")==0){
-                get_ip(send_buf, sizeof(send_buf));
-            }
-            else if(strcmp(buf,"GET_TEMP")==0){
-                get_temp(send_buf, sizeof(send_buf));
-            }
-            else if(strcmp(buf,"LED_ON")==0){
-                if(set_led(1)==0){
-                    snprintf(send_buf,sizeof(send_buf),"LED_ON");
-                }
-                else{
-                    snprintf(send_buf,sizeof(send_buf),"LED_ERROR");
-                }
-            }
-            else if(strcmp(buf,"LED_OFF")==0){
-                if(set_led(0)==0){
-                    snprintf(send_buf,sizeof(send_buf),"LED_OFF");
-                }
-                else{
-                    snprintf(send_buf,sizeof(send_buf),"LED_ERROR");
-                }
-            }
-            else{
-                snprintf(send_buf,sizeof(send_buf),"Unknown Command",buf);
-            }
-            send(client_fd,send_buf,strlen(send_buf),0);
-        }
-        
+        pthread_detach(tid);
+        /*线程结束自动回收资源*/
     }
-    close(client_fd);
-    close(server_fd);
     return 0;
 }

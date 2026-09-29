@@ -27,16 +27,18 @@ Ubuntu 上位机（client）  ────TCP 8888────>  i.MX6ULL（serv
 ### 本机验证（不需要开发板）
 
 ```bash
-make                      # 或：gcc server.c -o build/server && gcc client.c -o build/client
+make
 
 ./build/server            # 终端 1
 ./build/client            # 终端 2（SERVER_IP 改为 127.0.0.1）
 ```
 
+> 手动编译记得加 `-lpthread`：`gcc -Wall -Wextra server.c -o build/server -lpthread`
+
 ### 交叉编译到 i.MX6ULL
 
 ```bash
-arm-linux-gnueabihf-gcc server.c -o server_arm
+arm-linux-gnueabihf-gcc server.c -o server_arm -lpthread
 scp server_arm root@192.168.137.125:/home/root/
 ```
 
@@ -76,6 +78,28 @@ GET_CPU     --------------->
 - 应用层：纯文本命令，服务端用 `strcmp` 分发
 - 客户端输入 `quit` 主动断开
 
+## 并发模型
+
+服务端采用「主线程 accept + 每客户端一线程 + 一个常驻后台线程」的结构：
+
+```text
+main 线程 ── accept 循环 ──┬──> client_handler 线程 A ──> 服务客户端 A
+                          ├──> client_handler 线程 B ──> 服务客户端 B
+                          └──> client_handler 线程 C ──> 服务客户端 C
+
+cpu_monitor 线程（常驻）：每 1s 采样 ──写──>┐
+                                          g_cpu_usage（受 cpu_mutex 保护）
+所有 client_handler 线程：GET_CPU ──读──────┘
+```
+
+带来的三个收益：
+
+| 改造前 | 改造后 |
+| --- | --- |
+| 一次只能服务一个客户端 | 多客户端并发，互不干扰 |
+| 客户端断开后服务器随即退出 | 服务器长期驻留 |
+| `GET_CPU` 采样期间阻塞所有人 1 秒 | 后台线程持续采样，命令**秒回** |
+
 ## 三条获取系统信息的路线
 
 这是本项目最核心的知识结构：
@@ -109,6 +133,28 @@ GET_CPU     --------------->
 1. LED 若有 `trigger`（如 `heartbeat`、`mmc0`），**写 brightness 无效**，需先写 `none` 到 trigger
 2. `fprintf` 只是写进 stdio 缓冲区，**必须 `fclose()`** 才会真正生效，灯才会亮
 
+### 多线程的三个易错点
+
+**1. `client_fd` 必须用 `malloc` 传递，不能传局部变量地址**
+
+```c
+pthread_create(&tid, NULL, client_handler, &client_fd);   /* 错 */
+```
+
+主线程马上会回到循环顶部覆盖 `client_fd`，新线程读到的可能是别人的 fd，导致**客户端串线**。正确做法是每次 `malloc` 一块内存，线程里取完值立刻 `free`。
+
+同时 `buf` / `send_buf` 必须声明在线程函数内部（栈上），保证每个线程各有一份。
+
+**2. 只要「一个写者 + 至少一个读者」，读写两端都要加同一把锁**
+
+`double` 是 8 字节，Cortex-A7 是 32 位，一次读写需要两条指令。写线程刚写完前 4 字节时被读线程打断，读到的会是「半个新值 + 半个旧值」——偶发出现离谱数据，且难以复现。`volatile` 解决不了这个问题，只能靠锁。
+
+另外采用**方案 A（锁加在被调函数内部）**：锁的范围越小越好，默认不把整段流程锁住，只在真正出现「读-改-写」组合（如 `LED_TOGGLE`）时才外移到调用处。
+
+**3. 后台线程的异常路径必须 `sleep`，且绝不能退出**
+
+失败后若直接 `continue` 会跳过中间的 `usleep`，形成每秒十几万次的忙循环——**一个监控 CPU 的线程自己把 CPU 跑满**。同时后台线程一旦 `return`，`g_cpu_usage` 就永远停在最后一个值，表现为「程序不崩、没有报错，但数据死了」。此外失败时**不覆盖**全局变量：旧数据远比假的零值安全。
+
 ### 其他
 
 - `GET_IP` 用完的 socket 必须 `close(fd)`，否则每次调用泄漏一个文件描述符
@@ -128,15 +174,16 @@ GET_CPU     --------------->
 
 ## 后续路线
 
-- [ ] 多线程服务器（`pthread`）：支持多客户端并发 + 后台持续采样 CPU
-- [ ] 互斥锁保护 LED（多客户端同时操作硬件的资源竞争场景）
+- [x] 多线程服务器（`pthread`）：accept 循环 + 每客户端一线程
+- [x] 互斥锁保护 LED（多客户端同时操作硬件的资源竞争场景）
+- [x] 后台常驻采样线程：消除 `GET_CPU` 的 1 秒阻塞
 - [ ] 自定义应用层数据包（帧头 + 长度 + 校验）
 - [ ] Qt 图形化上位机
 - [ ] ESP32-CAM 视频流接入（GStreamer）
 
 ## 已知待改进
 
-- `set_led()` 末尾缺少 `return 0`，返回值不确定，会导致上层的成功判断不可靠
-- 单线程结构：一次只能服务一个客户端，`GET_CPU` 采样期间会阻塞所有请求
 - 客户端无法感知服务器断开（阻塞在 `fgets`，需引入 `select` / `poll`）
-- 各系统调用返回值未全部检查（`listen`、`send`、`fscanf` 等）
+- 纯文本协议没有帧边界，理论上存在**粘包**风险（由自定义数据包协议解决）
+- `listen()` / `send()` 等部分系统调用的返回值尚未检查
+- `GET_MEM` 回复内含 `\n`，多行数据不适合机器解析（自定义协议时统一处理）
