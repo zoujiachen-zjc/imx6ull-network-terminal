@@ -4,7 +4,6 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <string.h>
-#include "protocol.h"
 
 #define SERVER_IP "192.168.137.125"
 #define SERVER_PORT 8888
@@ -46,23 +45,27 @@ int main()
         if(strcmp(buf,"quit")==0){
             break;
         }
-        unsigned char frame[1100];
-        int flen=pack_frame(frame,buf);
-        if(flen<0){
-            printf("playload too long\n");
-            continue;
-        }
         //4.发送数据
-        if(send(client_fd,frame,flen,0)<0){
+        if(send(client_fd,buf,strlen(buf),0)<0){
             perror("send");
             break;
         }
-            int rlen=recv_frame(client_fd,buf,sizeof(buf));
-            if(rlen<0){
+            memset(buf,0,sizeof(buf));
+            //5. 接收服务器的数据
+            int ret=recv(client_fd,buf,sizeof(buf)-1,0);
+            if(ret>0){
+                buf[ret]='\0';
+                printf("server recv:%s\n",buf);
+            }
+            else if(ret==0){
                 printf("server closed\n");
                 break;
             }
-            printf("server recv:%s\n",buf);
+            else{
+                perror("recv");
+                break;
+            }
+     
     }
     //6.关闭socket
     close(client_fd);
